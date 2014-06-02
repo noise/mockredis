@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from hashlib import sha1
 from operator import add
 from random import choice, sample
+import time
 import re
-import string
 import sys
 
 from mockredis.clock import SystemClock
@@ -32,7 +32,13 @@ class MockRedis(object):
     expiry is NOT supported.
     """
 
-    def __init__(self, strict=False, clock=None, **kwargs):
+    def __init__(self,
+                 strict=False,
+                 clock=None,
+                 load_lua_dependencies=True,
+                 blocking_timeout=1000,
+                 blocking_sleep_interval=0.01,
+                 **kwargs):
         """
         Initialize as either StrictRedis or Redis.
 
@@ -40,6 +46,9 @@ class MockRedis(object):
         """
         self.strict = strict
         self.clock = SystemClock() if clock is None else clock
+        self.load_lua_dependencies = load_lua_dependencies
+        self.blocking_timeout = blocking_timeout
+        self.blocking_sleep_interval = blocking_sleep_interval
         # The 'Redis' store
         self.redis = defaultdict(dict)
         self.timeouts = defaultdict(dict)
@@ -123,7 +132,7 @@ class MockRedis(object):
     def delete(self, *keys):
         """Emulate delete."""
         key_counter = 0
-        for key in keys:
+        for key in map(str, keys):
             if key in self.redis:
                 del self.redis[key]
                 key_counter += 1
@@ -148,9 +157,10 @@ class MockRedis(object):
         self.timeouts[key] = self.clock.now() + delta
         return True
 
-    def expire(self, key, seconds):
+    def expire(self, key, delta):
         """Emulate expire"""
-        return self._expire(key, timedelta(seconds=seconds))
+        delta = delta if isinstance(delta, timedelta) else timedelta(seconds=delta)
+        return self._expire(key, delta)
 
     def pexpire(self, key, milliseconds):
         """Emulate pexpire"""
@@ -517,6 +527,45 @@ class MockRedis(object):
         # Redis returns 0 if list doesn't exist
         return len(redis_list)
 
+    def _blocking_pop(self, pop_func, keys, timeout):
+        """Emulate blocking pop functionality"""
+        if not isinstance(timeout, (int, long)):
+            raise RuntimeError('timeout is not an integer or out of range')
+
+        if timeout is None or timeout == 0:
+            timeout = self.blocking_timeout
+
+        if isinstance(keys, basestring):
+            keys = [keys]
+        else:
+            keys = list(keys)
+
+        elapsed_time = 0
+        start = time.time()
+        while elapsed_time < timeout:
+            key, val = self._pop_first_available(pop_func, keys)
+            if val:
+                return key, val
+            # small delay to avoid high cpu utilization
+            time.sleep(self.blocking_sleep_interval)
+            elapsed_time = time.time() - start
+        return None
+
+    def _pop_first_available(self, pop_func, keys):
+        for key in keys:
+            val = pop_func(key)
+            if val:
+                return key, val
+        return None, None
+
+    def blpop(self, keys, timeout=0):
+        """Emulate blpop"""
+        return self._blocking_pop(self.lpop, keys, timeout)
+
+    def brpop(self, keys, timeout=0):
+        """Emulate brpop"""
+        return self._blocking_pop(self.rpop, keys, timeout)
+
     def lpop(self, key):
         """Emulate lpop."""
         redis_list = self._get_list(key, 'LPOP')
@@ -567,6 +616,7 @@ class MockRedis(object):
 
     def lrem(self, key, value, count=0):
         """Emulate lrem."""
+        key, value = str(key), str(value)
         redis_list = self._get_list(key, 'LREM')
         removed_count = 0
         if key in self.redis:
@@ -613,6 +663,16 @@ class MockRedis(object):
         if transfer_item is not None:
             self.lpush(destination, transfer_item)
         return transfer_item
+
+    def brpoplpush(self, source, destination, timeout=0):
+        """Emulate brpoplpush"""
+        transfer_item = self.brpop(source, timeout)
+        if transfer_item is None:
+            return None
+
+        key, val = transfer_item
+        self.lpush(destination, val)
+        return val
 
     def lset(self, key, index, value):
         """Emulate lset."""
@@ -969,7 +1029,7 @@ class MockRedis(object):
 
         scorerange = zset.scorerange(float(min_), float(max_))
         if start is not None and num is not None:
-            start, num = self._translate_limit(len(scorerange), start, num)
+            start, num = self._translate_limit(len(scorerange), int(start), int(num))
             scorerange = scorerange[start:start + num]
         return [func(item) for item in scorerange]
 
@@ -1023,6 +1083,7 @@ class MockRedis(object):
 
     def zrevrangebyscore(self, name, max_, min_, start=None, num=None,
                          withscores=False, score_cast_func=float):
+
         if (start is None) ^ (num is None):
             raise RedisError('`start` and `num` must both be specified')
 
@@ -1034,7 +1095,7 @@ class MockRedis(object):
 
         scorerange = [x for x in reversed(zset.scorerange(float(min_), float(max_)))]
         if start is not None and num is not None:
-            start, num = self._translate_limit(len(scorerange), start, num)
+            start, num = self._translate_limit(len(scorerange), int(start), int(num))
             scorerange = scorerange[start:start + num]
         return [func(item) for item in scorerange]
 
@@ -1081,7 +1142,7 @@ class MockRedis(object):
         """Emulates evalsha"""
         if not self.script_exists(sha)[0]:
             raise RedisError("Sha not registered")
-        script_callable = Script(self, self.shas[sha])
+        script_callable = Script(self, self.shas[sha], self.load_lua_dependencies)
         numkeys = max(numkeys, 0)
         keys = keys_and_args[:numkeys]
         args = keys_and_args[numkeys:]
@@ -1108,24 +1169,27 @@ class MockRedis(object):
 
     def register_script(self, script):
         """Emulate register_script"""
-        return Script(self, script)
+        return Script(self, script, self.load_lua_dependencies)
 
     def call(self, command, *args):
         """
         Sends call to the function, whose name is specified by command.
+
+        Used by Script invocations and normalizes calls using standard
+        Redis arguments to use the expected redis-py arguments.
         """
         command = self._normalize_command_name(command)
         args = self._normalize_command_args(command, *args)
 
         redis_function = getattr(self, command)
         value = redis_function(*args)
-        return value
+        return self._normalize_command_response(command, value)
 
     def _normalize_command_name(self, command):
         """
         Modifies the command string to match the redis client method name.
         """
-        command = string.lower(command)
+        command = command.lower()
 
         if command == 'del':
             return 'delete'
@@ -1142,11 +1206,39 @@ class MockRedis(object):
             zadd_args = [x for tup in zip(args[2::2], args[1::2]) for x in tup]
             return [args[0]] + zadd_args
 
-        if command == 'zrangebyscore' and len(args) == 6:
-            # Remove 'limit' from arguments
-            return args[:3] + args[4:]
+        if command in ('zrangebyscore', 'zrevrangebyscore'):
+            # expected format is: <command> name min max start num with_scores score_cast_func
+            if len(args) <= 3:
+                # just plain min/max
+                return args
+
+            start, num = None, None
+            withscores = False
+
+            for i, arg in enumerate(args[3:], 3):
+                # keywords are case-insensitive
+                lower_arg = str(arg).lower()
+
+                # handle "limit"
+                if lower_arg == "limit" and i + 2 < len(args):
+                    start, num = args[i + 1], args[i + 2]
+
+                # handle "withscores"
+                if lower_arg == "withscores":
+                    withscores = True
+
+            # do not expect to set score_cast_func
+
+            return args[:3] + (start, num, withscores)
 
         return args
+
+    def _normalize_command_response(self, command, response):
+        if command in ('zrange', 'zrevrange', 'zrangebyscore', 'zrevrangebyscore'):
+            if response and isinstance(response[0], tuple):
+                return [value for tpl in response for value in tpl]
+
+        return response
 
     #### PubSub commands ####
 
@@ -1183,6 +1275,7 @@ class MockRedis(object):
         """
         Get (and maybe create) a redis data structure by name and type.
         """
+        key = str(key)
         if self.type(key) in [type_, 'none']:
             if create:
                 return self.redis.setdefault(key, default)
