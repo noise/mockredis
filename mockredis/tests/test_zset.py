@@ -147,6 +147,13 @@ class TestRedisZset(object):
         self.redis.zadd(key, 1, 1.0)
         eq_(1.0, self.redis.zscore(key, 1))
 
+    def test_zscore_float_member(self):
+        key = "zset"
+        eq_(None, self.redis.zscore(key, 1))
+
+        self.redis.zadd(key, 1, 1.2345678901234)
+        eq_(1.2345678901234, self.redis.zscore(key, 1))
+
     def test_zrank(self):
         key = "zset"
         eq_(None, self.redis.zrank(key, "two"))
@@ -312,6 +319,14 @@ class TestRedisZset(object):
 
         eq_([], self.redis.zrange(key, 0, -1))
         eq_([], self.redis.keys("*"))
+
+    def test_zrange_float_scores(self):
+        """
+        Make sure zrange doesn't truncate our floats, see #58
+        """
+        key = "zset"
+        self.redis.zadd(key, "long", 1.2345678901234)
+        eq_([("long", 1.2345678901234)], self.redis.zrange(key, 0, -1, withscores=True))
 
     def test_zunionstore_no_keys(self):
         key = "zset"

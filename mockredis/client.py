@@ -1309,7 +1309,11 @@ class MockRedis(object):
         Return a suitable function from (score, member)
         """
         if withscores:
-            return lambda score_member: (score_member[1], score_cast_func(str(score_member[0])))
+            if score_cast_func == float:
+                # don't cast to string first or it will truncate the float, see #58
+                return lambda score_member: (score_member[1], score_cast_func(score_member[0]))
+            else:
+                return lambda score_member: (score_member[1], score_cast_func(str(score_member[0])))
         else:
             return lambda score_member: score_member[1]
 
